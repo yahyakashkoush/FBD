@@ -1,29 +1,40 @@
 import { NextRequest, NextResponse } from "next/server";
 import { jwtVerify } from "jose";
 
-async function queryDuckDB(id: string): Promise<{ id: string; phone: string; email: string | null } | null> {
-  // Dynamic import to avoid bundling issues
-  const duckdb = await import("duckdb");
-  const Database = duckdb.default ?? duckdb;
+type Row = { id: string; phone: string; email: string | null };
+
+async function runDuckDBSearch(id: string): Promise<Row | null> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const duckdb = require("duckdb");
+  const parquetUrl = process.env.PARQUET_URL!;
 
   return new Promise((resolve, reject) => {
-    const db = new (Database as any)(":memory:");
-    db.all(
-      `INSTALL httpfs; LOAD httpfs;
-       SELECT id::VARCHAR AS id, '+'||phone::VARCHAR AS phone, email
-       FROM parquet_scan('${process.env.PARQUET_URL}')
-       WHERE id = ${BigInt(id)}
-       LIMIT 1`,
-      (err: Error | null, rows: Record<string, unknown>[]) => {
-        db.close();
-        if (err) reject(err);
-        else resolve(rows?.[0] ? {
-          id: String(rows[0].id),
-          phone: String(rows[0].phone),
-          email: rows[0].email != null ? String(rows[0].email) : null,
-        } : null);
+    const db = new duckdb.Database(":memory:");
+
+    db.exec("INSTALL httpfs; LOAD httpfs;", (err: Error | null) => {
+      if (err) {
+        // httpfs might already be available (built-in), continue anyway
       }
-    );
+
+      db.all(
+        `SELECT id::VARCHAR AS id,
+                '+'||phone::VARCHAR AS phone,
+                email
+         FROM parquet_scan('${parquetUrl}')
+         WHERE id = ${BigInt(id)}
+         LIMIT 1`,
+        (err2: Error | null, rows: Record<string, unknown>[]) => {
+          db.close();
+          if (err2) return reject(err2);
+          if (!rows || rows.length === 0) return resolve(null);
+          resolve({
+            id: String(rows[0].id),
+            phone: String(rows[0].phone),
+            email: rows[0].email != null ? String(rows[0].email) : null,
+          });
+        }
+      );
+    });
   });
 }
 
@@ -47,9 +58,8 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const row = await queryDuckDB(id);
-    if (!row) return NextResponse.json({ rows: [] });
-    return NextResponse.json({ rows: [row] });
+    const row = await runDuckDBSearch(id);
+    return NextResponse.json({ rows: row ? [row] : [] });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "query error";
     return NextResponse.json({ error: msg }, { status: 500 });
